@@ -272,7 +272,10 @@ class TCell(Agent):
 # ---------------------------------------------------------
 class TissueModel(Model):
     def __init__(self, num_cancer=25, num_tcell=8, tcell_energy=60, 
-                 base_proliferation=0.06, drug_type="None"):
+                 base_proliferation=0.06, drug_type="None", seed=None):
+        # Mesa 2.x reads the `seed` kwarg in Model.__new__ and builds self.random
+        # from it, so declaring it here makes runs reproducible: same seed ->
+        # identical trajectory. seed=None keeps the old random behavior.
         super().__init__()
         self.num_cancer = num_cancer
         self.num_tcell = num_tcell

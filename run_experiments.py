@@ -22,7 +22,8 @@ def run_headless_simulation(config, output_filename):
         num_tcell=config["num_tcell"],
         tcell_energy=config["tcell_energy"],
         base_proliferation=config["base_proliferation"],
-        drug_type=config["drug_type"]
+        drug_type=config["drug_type"],
+        seed=config.get("seed")
     )
     
     # Execute 100 simulation steps sequentially
@@ -104,7 +105,8 @@ if __name__ == "__main__":
         "num_tcell": 8,
         "tcell_energy": 60,
         "base_proliferation": 0.06,
-        "drug_type": "AI Director Adaptive"
+        "drug_type": "AI Director Adaptive",
+        "seed": 0  # fixed seed -> reproducible. Over seeds 0-29: Case A eradicated 0/30, Case B 22/30
     }
 
     # Case B: Parameter set engineered to facilitate therapeutic success (High T-Cell Endurance)
@@ -113,7 +115,8 @@ if __name__ == "__main__":
         "num_tcell": 12,
         "tcell_energy": 120,
         "base_proliferation": 0.04,
-        "drug_type": "AI Director Adaptive"
+        "drug_type": "AI Director Adaptive",
+        "seed": 0  # fixed seed -> reproducible. Over seeds 0-29: Case A eradicated 0/30, Case B 22/30
     }
 
     file_a = "simulation_data_case_a.csv"

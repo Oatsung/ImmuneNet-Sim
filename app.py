@@ -19,9 +19,9 @@ class InfoDisplay(TextElement):
         if model is None or model.schedule is None:
             return ""
             
-        red_count = len([a for a in model.schedule.agents if isinstance(a, CancerCell) and not a.is_mutated])
-        orange_count = len([a for a in model.schedule.agents if isinstance(a, CancerCell) and a.is_mutated])
-        tcell_count = len([a for a in model.schedule.agents if isinstance(a, TCell)])
+        red_count = model.n_normal_cancer
+        orange_count = model.n_mutated_cancer
+        tcell_count = model.n_tcells
         
         def get_badge(is_active, active_text="ON", inactive_text="OFF", active_color="#2ECC71"):
             if is_active:
@@ -89,6 +89,116 @@ class InfoDisplay(TextElement):
         return html_content
 
 # ---------------------------------------------------------
+# 1b. Spatial index: packed NumPy mirror of live cancer cells
+# ---------------------------------------------------------
+class CancerIndex:
+    """Keeps the positions of all live cancer cells in packed NumPy arrays.
+
+    T-cells need "which cancer cell is closest to me?" every step. Answering that
+    by scanning schedule.agents costs O(all agents) *per T-cell* (and Mesa copies
+    the whole agent set on every access). Here it is one vectorized distance
+    computation.
+
+    Ties (several cancer cells at the same distance) are broken by their position in
+    the scheduler's current activation order -- exactly what the old linear scan over
+    schedule.agents picked -- so seeded simulation results are unchanged.
+    RankedActivation refreshes those ranks once per step after Mesa shuffles.
+    """
+
+    def __init__(self, capacity=64):
+        self.x = np.empty(capacity, dtype=np.int64)
+        self.y = np.empty(capacity, dtype=np.int64)
+        self.ids = np.empty(capacity, dtype=np.int64)
+        self.rank = np.empty(capacity, dtype=np.int64)  # position in scheduler order
+        self.mutated = np.empty(capacity, dtype=bool)
+        self.agents = [None] * capacity
+        self.slot = {}
+        self.n = 0
+        self.next_rank = 0  # agents added mid-step go to the end of the order
+
+    def _grow(self):
+        cap = len(self.agents) * 2
+        for name in ("x", "y", "ids", "rank", "mutated"):
+            old = getattr(self, name)
+            new = np.empty(cap, dtype=old.dtype)
+            new[: self.n] = old[: self.n]
+            setattr(self, name, new)
+        self.agents.extend([None] * (cap - len(self.agents)))
+
+    def add(self, agent):
+        if self.n == len(self.agents):
+            self._grow()
+        i = self.n
+        self.x[i], self.y[i] = agent.pos
+        self.ids[i] = agent.unique_id
+        self.rank[i] = self.next_rank
+        self.next_rank += 1
+        self.mutated[i] = agent.is_mutated
+        self.agents[i] = agent
+        self.slot[agent.unique_id] = i
+        self.n += 1
+
+    def remove(self, agent):
+        i = self.slot.pop(agent.unique_id)
+        last = self.n - 1
+        if i != last:  # swap the last entry into the freed slot
+            self.x[i], self.y[i] = self.x[last], self.y[last]
+            self.ids[i] = self.ids[last]
+            self.rank[i] = self.rank[last]
+            self.mutated[i] = self.mutated[last]
+            self.agents[i] = self.agents[last]
+            self.slot[int(self.ids[i])] = i
+        self.agents[last] = None
+        self.n -= 1
+
+    def move(self, agent):
+        i = self.slot[agent.unique_id]
+        self.x[i], self.y[i] = agent.pos
+
+    def nearest(self, pos):
+        """Closest live cancer cell to pos (squared Euclidean), or None."""
+        n = self.n
+        if n == 0:
+            return None
+        dx = self.x[:n] - pos[0]
+        dy = self.y[:n] - pos[1]
+        d2 = dx * dx + dy * dy
+        best = np.flatnonzero(d2 == d2.min())
+        if len(best) > 1:
+            best = best[[int(np.argmin(self.rank[best]))]]
+        return self.agents[int(best[0])]
+
+    def refresh_ranks(self, ordered_agents):
+        """Re-read the scheduler's activation order (call right after the shuffle)."""
+        slot = self.slot
+        rank = self.rank
+        r = 0
+        for agent in ordered_agents:
+            i = slot.get(agent.unique_id)
+            if i is not None:
+                rank[i] = r
+            r += 1
+        self.next_rank = r
+
+    @property
+    def n_mutated(self):
+        return int(self.mutated[: self.n].sum())
+
+
+class RankedActivation(RandomActivation):
+    """RandomActivation that tells the CancerIndex the new order after each shuffle.
+
+    Same RNG use and same activation order as Mesa 2.3.0's RandomActivation.
+    """
+
+    def do_each(self, method, shuffle=False):
+        if shuffle:
+            self._agents.shuffle(inplace=True)
+            self.model.cancer_index.refresh_ranks(self._agents)
+        self._agents.do(method)
+
+
+# ---------------------------------------------------------
 # 2. Agent: ผู้วางแผนการรักษาจำลอง (AI Doctor)
 # ---------------------------------------------------------
 class DirectorAgent(Agent):
@@ -101,20 +211,9 @@ class DirectorAgent(Agent):
         if self.model.schedule is None:
             return
 
-        current_orange_count = 0
-        current_red_count = 0
-        current_tcell_count = 0
-        
-        for agent in self.model.schedule.agents:
-            if agent is None:
-                continue
-            if isinstance(agent, CancerCell):
-                if agent.is_mutated:
-                    current_orange_count += 1
-                else:
-                    current_red_count += 1
-            elif isinstance(agent, TCell):
-                current_tcell_count += 1
+        current_orange_count = self.model.n_mutated_cancer
+        current_red_count = self.model.n_normal_cancer
+        current_tcell_count = self.model.n_tcells
 
         total_cancer = current_red_count + current_orange_count
         # AI Trigger conditions
@@ -138,6 +237,7 @@ class DirectorAgent(Agent):
                     rx = self.random.randrange(self.model.grid.width)
                     ry = self.random.randrange(self.model.grid.height)
                     self.model.grid.place_agent(new_tcell, (rx, ry))
+                    self.model.n_tcells += 1
 
 # ---------------------------------------------------------
 # 3. Agent: เซลล์มะเร็ง (มีระบบกลายพันธุ์ดื้อยา)
@@ -172,6 +272,7 @@ class CancerCell(Agent):
                     new_cancer = CancerCell(self.model.next_id(), self.model, is_mutated=will_mutate)
                     self.model.grid.place_agent(new_cancer, new_pos)
                     self.model.schedule.add(new_cancer)
+                    self.model.cancer_index.add(new_cancer)
 
         if self.random.random() < 0.20:
             possible_steps = self.model.grid.get_neighborhood(self.pos, moore=True, include_center=False)
@@ -179,6 +280,7 @@ class CancerCell(Agent):
                 new_position = self.random.choice(possible_steps)
                 if new_position is not None:
                     self.model.grid.move_agent(self, new_position)
+                    self.model.cancer_index.move(self)
 
 # ---------------------------------------------------------
 # 4. Agent: เม็ดเลือดขาว (T-Cell -> CAR-T Cell Evolution)
@@ -204,6 +306,7 @@ class TCell(Agent):
         if self.energy <= 0:
             self.model.grid.remove_agent(self)
             self.model.schedule.remove(self)
+            self.model.n_tcells -= 1
             return
 
         possible_steps = self.model.grid.get_neighborhood(self.pos, moore=True, include_center=False)
@@ -221,21 +324,13 @@ class TCell(Agent):
             best_step_index = np.argmax(ifn_values)
             new_position = possible_steps[best_step_index]
         else:
-            cancer_cells = [agent for agent in self.model.schedule.agents if isinstance(agent, CancerCell)]
-            if cancer_cells:
-                def calculate_distance(agent1, agent2):
-                    if agent1.pos is None or agent2.pos is None: return float('inf')
-                    return (agent1.pos[0] - agent2.pos[0])**2 + (agent1.pos[1] - agent2.pos[1])**2
-                
-                closest_cancer = min(cancer_cells, key=lambda c: calculate_distance(self, c))
-                if closest_cancer.pos is not None:
-                    target_pos = closest_cancer.pos
-                    def step_distance(step_pos, target_pos):
-                        if step_pos is None or target_pos is None: return float('inf')
-                        return (step_pos[0] - target_pos[0])**2 + (step_pos[1] - target_pos[1])**2
-                    new_position = min(possible_steps, key=lambda p: step_distance(p, target_pos))
-                else:
-                    new_position = self.random.choice(possible_steps)
+            closest_cancer = self.model.cancer_index.nearest(self.pos)
+            if closest_cancer is not None:
+                target_pos = closest_cancer.pos
+                def step_distance(step_pos, target_pos):
+                    if step_pos is None or target_pos is None: return float('inf')
+                    return (step_pos[0] - target_pos[0])**2 + (step_pos[1] - target_pos[1])**2
+                new_position = min(possible_steps, key=lambda p: step_distance(p, target_pos))
             else:
                 new_position = self.random.choice(possible_steps)
 
@@ -251,6 +346,7 @@ class TCell(Agent):
                     is_target_mutated = agent.is_mutated
                     self.model.grid.remove_agent(agent)
                     self.model.schedule.remove(agent)
+                    self.model.cancer_index.remove(agent)
                     
                     cx, cy = self.pos
                     if 0 <= cx < self.model.grid.width and 0 <= cy < self.model.grid.height:
@@ -273,7 +369,7 @@ class TCell(Agent):
 class TissueModel(Model):
     def __init__(self, num_cancer=25, num_tcell=8, tcell_energy=60, 
                  base_proliferation=0.06, drug_type="None", seed=None,
-                 grid_size=20):
+                 grid_size=20, autosave_csv=True):
         # Mesa 2.x reads the `seed` kwarg in Model.__new__ and builds self.random
         # from it, so declaring it here makes runs reproducible: same seed ->
         # identical trajectory. seed=None keeps the old random behavior.
@@ -283,8 +379,15 @@ class TissueModel(Model):
         self.base_proliferation = base_proliferation
         self.initial_tcell_energy = tcell_energy
         self.grid = MultiGrid(grid_size, grid_size, False)
-        self.schedule = RandomActivation(self)
-        
+        self.schedule = RankedActivation(self)
+
+        # Population bookkeeping kept incrementally so nothing has to scan every agent.
+        self.cancer_index = CancerIndex()
+        self.n_tcells = 0
+        # GUI mode rewrites simulation_data.csv every step. Headless/batch runs should
+        # pass autosave_csv=False and call export_csv() once at the end.
+        self.autosave_csv = autosave_csv
+
         self.ifn_grid = np.zeros((grid_size, grid_size))
         self.tgf_grid = np.zeros((grid_size, grid_size))
         
@@ -298,6 +401,7 @@ class TissueModel(Model):
             x = self.random.randrange(self.grid.width)
             y = self.random.randrange(self.grid.height)
             self.grid.place_agent(cancer, (x, y))
+            self.cancer_index.add(cancer)
 
         for i in range(self.num_tcell):
             tcell = TCell(self.next_id(), self, tcell_energy)
@@ -305,6 +409,7 @@ class TissueModel(Model):
             x = self.random.randrange(self.grid.width)
             y = self.random.randrange(self.grid.height)
             self.grid.place_agent(tcell, (x, y))
+            self.n_tcells += 1
 
         if drug_type == "AI Director Adaptive":
             director = DirectorAgent(self.next_id(), self, threshold=5)
@@ -312,24 +417,36 @@ class TissueModel(Model):
 
         self.datacollector = DataCollector(
             model_reporters={
-                "Normal Cancer (Red)": lambda m: len([a for a in m.schedule.agents if isinstance(a, CancerCell) and not a.is_mutated]),
-                "Mutated Cancer (Orange)": lambda m: len([a for a in m.schedule.agents if isinstance(a, CancerCell) and a.is_mutated]),
-                "Active T-Cells": lambda m: len([a for a in m.schedule.agents if isinstance(a, TCell)]),
+                "Normal Cancer (Red)": lambda m: m.n_normal_cancer,
+                "Mutated Cancer (Orange)": lambda m: m.n_mutated_cancer,
+                "Active T-Cells": lambda m: m.n_tcells,
                 "Total IFN-g (Signal)": lambda m: np.sum(m.ifn_grid),
                 "Total TGF-b (Toxin)": lambda m: np.sum(m.tgf_grid),
                 "Combo Therapy Active (Indicator)": lambda m: 40.0 if (m.immunotherapy_active and m.targeted_therapy_active) else 0.0
             }
         )
 
+    # ---- live population counts (O(1), no agent scan) ----
+    @property
+    def n_mutated_cancer(self):
+        return self.cancer_index.n_mutated
+
+    @property
+    def n_normal_cancer(self):
+        return self.cancer_index.n - self.cancer_index.n_mutated
+
+    def export_csv(self, path="simulation_data.csv"):
+        """Write the collected telemetry to CSV (same format the GUI autosave uses)."""
+        self.datacollector.get_model_vars_dataframe().to_csv(path, index_label="Step")
+
     def step(self):
         self.datacollector.collect(self)
         self.schedule.step()
         self.ifn_grid *= 0.8
         self.tgf_grid *= 0.8
-        
-        if self.datacollector is not None:
-            df = self.datacollector.get_model_vars_dataframe()
-            df.to_csv("simulation_data.csv", index_label="Step")
+
+        if self.autosave_csv:
+            self.export_csv("simulation_data.csv")
 
 # ---------------------------------------------------------
 # 6. ส่วนแสดงผล UI

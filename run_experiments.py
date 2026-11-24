@@ -1,21 +1,10 @@
-import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from app import TissueModel
 
-def clean_temporary_files():
-    """Clear pre-existing simulation artifacts before running experiments."""
-    if os.path.exists("simulation_data.csv"):
-        try:
-            os.remove("simulation_data.csv")
-        except OSError:
-            pass
-
 def run_headless_simulation(config, output_filename):
-    """Executes the TissueModel without GUI and renames the auto-generated telemetry."""
-    clean_temporary_files()
-    
+    """Executes the TissueModel without GUI and writes its telemetry to output_filename."""
     print(f"🧬 Initializing In-Silico Trial: {output_filename}...")
     model = TissueModel(
         num_cancer=config["num_cancer"],
@@ -23,19 +12,16 @@ def run_headless_simulation(config, output_filename):
         tcell_energy=config["tcell_energy"],
         base_proliferation=config["base_proliferation"],
         drug_type=config["drug_type"],
-        seed=config.get("seed")
+        seed=config.get("seed"),
+        autosave_csv=False  # the per-step autosave is only for the GUI; write once at the end
     )
-    
+
     # Execute 100 simulation steps sequentially
     for step in range(100):
         model.step()
-        
-    if os.path.exists("simulation_data.csv"):
-        # 🛠️ [FIX] ใช้ os.replace แทน os.rename เพื่อแก้ปัญหา FileExistsError: [WinError 183] บน Windows
-        os.replace("simulation_data.csv", output_filename)
-        print(f"💾 Telemetry logged and preserved as '{output_filename}'\n")
-    else:
-        raise FileNotFoundError("Error: Core engine failed to generate simulation_data.csv")
+
+    model.export_csv(output_filename)
+    print(f"💾 Telemetry logged and preserved as '{output_filename}'\n")
 
 def generate_comparative_matrix_plot(file_a, file_b):
     """Generates a 2x2 publication-grade visualization comparing both trials."""

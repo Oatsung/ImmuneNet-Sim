@@ -272,7 +272,8 @@ class TCell(Agent):
 # ---------------------------------------------------------
 class TissueModel(Model):
     def __init__(self, num_cancer=25, num_tcell=8, tcell_energy=60, 
-                 base_proliferation=0.06, drug_type="None", seed=None):
+                 base_proliferation=0.06, drug_type="None", seed=None,
+                 grid_size=20):
         # Mesa 2.x reads the `seed` kwarg in Model.__new__ and builds self.random
         # from it, so declaring it here makes runs reproducible: same seed ->
         # identical trajectory. seed=None keeps the old random behavior.
@@ -281,11 +282,11 @@ class TissueModel(Model):
         self.num_tcell = num_tcell
         self.base_proliferation = base_proliferation
         self.initial_tcell_energy = tcell_energy
-        self.grid = MultiGrid(20, 20, False)
+        self.grid = MultiGrid(grid_size, grid_size, False)
         self.schedule = RandomActivation(self)
         
-        self.ifn_grid = np.zeros((20, 20)) 
-        self.tgf_grid = np.zeros((20, 20)) 
+        self.ifn_grid = np.zeros((grid_size, grid_size))
+        self.tgf_grid = np.zeros((grid_size, grid_size))
         
         self.immunotherapy_active = (drug_type in ["Immunotherapy", "Combination Therapy"])
         self.targeted_therapy_active = (drug_type in ["Targeted Therapy", "Combination Therapy"])
